@@ -1,9 +1,0 @@
-Received: from client.example.com (127.0.0.1)
-  by mail.example.com with ESMTP id 1781663546;
-  Wed, 17 Jun 2026 02:32:26 +0000
-From: bob@example.com
-To: alice@example.com
-Subject: SMTP integration test
-
-Hello Alice,
-This is a test from SMTP.

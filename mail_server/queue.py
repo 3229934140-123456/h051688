@@ -23,6 +23,23 @@ class RemoteDeliveryError(Exception):
     pass
 
 
+def dot_stuff_message(raw: str) -> str:
+    """
+    Apply SMTP dot-stuffing per RFC 5321 §4.5.2.
+    - Lines starting with '.' get an extra '.' prepended
+    - The message is normalized to end with \r\n
+    - A terminating '.\r\n' is appended
+    """
+    lines = raw.split("\r\n")
+    stuffed = []
+    for line in lines:
+        if line.startswith("."):
+            stuffed.append("." + line)
+        else:
+            stuffed.append(line)
+    return "\r\n".join(stuffed) + "\r\n.\r\n"
+
+
 class RemoteDeliveryAgent:
     """
     Remote Delivery Agent (MDA for remote recipients).
@@ -43,17 +60,27 @@ class RemoteDeliveryAgent:
             if not chunk:
                 break
             data += chunk
-            if len(data) >= 4 and data[3:4] == b" ":
-                break
-            if data.endswith(b"\r\n") and data[3:4] == b"-":
+            if not data.endswith(b"\r\n"):
                 continue
-            if data.endswith(b"\r\n"):
+            lines = data.split(b"\r\n")
+            last_line = None
+            for line in lines:
+                if line:
+                    last_line = line
+            if last_line is None or len(last_line) < 4:
+                continue
+            if last_line[3:4] == b" ":
+                break
+            elif last_line[3:4] == b"-":
+                continue
+            else:
                 break
         text = data.decode("utf-8", errors="replace")
         self.logger.debug(f"RX: {text.strip()}")
         try:
-            code = int(text[:3])
-        except ValueError:
+            first_line = text.split("\r\n", 1)[0]
+            code = int(first_line[:3])
+        except (ValueError, IndexError):
             code = 0
         return code, text
 
@@ -147,8 +174,8 @@ class RemoteDeliveryAgent:
             if code != 354:
                 raise RemoteDeliveryError(f"DATA rejected: {resp.strip()}")
 
-            encoded_body = message.raw_data.rstrip("\r\n") + "\r\n.\r\n"
-            sock.sendall(encoded_body.encode("utf-8", errors="replace"))
+            stuffed = dot_stuff_message(message.raw_data)
+            sock.sendall(stuffed.encode("utf-8", errors="replace"))
             code, resp = self._read_response(sock)
             if code != 250:
                 raise RemoteDeliveryError(f"Message body rejected: {resp.strip()}")

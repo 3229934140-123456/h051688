@@ -150,6 +150,7 @@ class POP3Session:
             self.state = "TRANSACTION"
             self.mailbox.pop3_reset_deleted(self.user)
             self.deleted_msgs = []
+            self._session_messages = self.mailbox.pop3_list(self.user)
             self.logger.info(f"[{self.client_ip}] POP3 login: {self.user}")
             self._send("+OK logged in")
         else:
@@ -283,15 +284,11 @@ class POP3Session:
         if not self._valid_msg_num(n):
             self._send("-ERR no such message")
             return
-        if self.mailbox.pop3_mark_deleted(self.user, n):
-            self.deleted_msgs.append(n)
-            self._send("+OK marked for deletion")
-        else:
-            self._send("-ERR failed to mark")
+        self.deleted_msgs.append(n)
+        self._send("+OK marked for deletion")
 
     def _cmd_rset(self, args: str):
         self.deleted_msgs = []
-        self.mailbox.pop3_reset_deleted(self.user)
         self._send("+OK reset")
 
     def _cmd_last(self, args: str):
@@ -307,8 +304,18 @@ class POP3Session:
     def _cmd_quit(self, args: str):
         if self.state == "TRANSACTION":
             self.state = "UPDATE"
-            removed = self.mailbox.expunge(self.user, "INBOX")
-            self.logger.info(f"[{self.client_ip}] POP3 QUIT: expunged {len(removed)} messages for {self.user}")
+            if self.deleted_msgs:
+                all_msgs = self.mailbox.pop3_list(self.user)
+                for n in self.deleted_msgs:
+                    if 1 <= n <= len(all_msgs):
+                        uid, _ = all_msgs[n - 1]
+                        self.mailbox.update_flags(self.user, "INBOX", uid, deleted=True)
+                removed = self.mailbox.expunge(self.user, "INBOX")
+                self.logger.info(
+                    f"[{self.client_ip}] POP3 QUIT: expunged {len(removed)} messages for {self.user}"
+                )
+            else:
+                self.logger.info(f"[{self.client_ip}] POP3 QUIT: no messages to delete")
         self._send("+OK Bye")
 
 

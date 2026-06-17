@@ -128,23 +128,6 @@ class IMAPSession:
         tag = parts[0]
         verb = parts[1].upper()
         args = parts[2] if len(parts) > 2 else ""
-
-        while "{" in args and args.rstrip().endswith("}"):
-            m = re.search(r"\{(\d+)\}\s*$", args)
-            if not m:
-                break
-            n_bytes = int(m.group(1))
-            self._send_continuation()
-            literal_data = self._read_literal(n_bytes)
-            try:
-                literal_str = literal_data.decode("utf-8", errors="replace")
-            except Exception:
-                literal_str = literal_data.decode("latin-1", errors="replace")
-            args = args[:m.start()] + literal_str
-            more_line = self._readline()
-            if more_line:
-                args += " " + more_line
-
         self._dispatch(tag, verb, args)
 
     def _dispatch(self, tag: str, verb: str, args: str):
@@ -438,14 +421,39 @@ class IMAPSession:
         self._send(tag, "OK STATUS completed")
 
     def _cmd_create(self, tag: str, args: str):
-        folder = self._parse_imap_string(args)
-        self._send(tag, f'OK CREATE "{folder}" completed')
+        folder = self._parse_imap_string(args.strip())
+        if not folder:
+            self._send(tag, "BAD CREATE requires mailbox name")
+            return
+        if self.mailbox.create_folder(self.user, folder):
+            self._send(tag, f'OK CREATE "{folder}" completed')
+        else:
+            self._send(tag, f'NO [ALREADYEXISTS] Mailbox "{folder}" already exists')
 
     def _cmd_delete(self, tag: str, args: str):
-        self._send(tag, "OK DELETE completed")
+        folder = self._parse_imap_string(args.strip())
+        if folder.upper() == "INBOX":
+            self._send(tag, "NO CANNOT delete INBOX")
+            return
+        if self.mailbox.delete_folder(self.user, folder):
+            self._send(tag, "OK DELETE completed")
+        else:
+            self._send(tag, "NO DELETE failed: mailbox does not exist")
 
     def _cmd_rename(self, tag: str, args: str):
-        self._send(tag, "OK RENAME completed")
+        parts = self._split_args(args)
+        if len(parts) < 2:
+            self._send(tag, "BAD RENAME requires old-name new-name")
+            return
+        old_name = self._parse_imap_string(parts[0])
+        new_name = self._parse_imap_string(parts[1])
+        if old_name.upper() == "INBOX":
+            self._send(tag, "NO CANNOT rename INBOX")
+            return
+        if self.mailbox.rename_folder(self.user, old_name, new_name):
+            self._send(tag, "OK RENAME completed")
+        else:
+            self._send(tag, "NO RENAME failed")
 
     # ---------- commands: search / fetch / store / copy / uid ----------
     def _cmd_search(self, tag: str, args: str):
@@ -499,48 +507,71 @@ class IMAPSession:
             if meta is None:
                 continue
             raw = self.mailbox.get_message_raw(self.user, self.current_folder, uid) or ""
-            data_parts = []
+
+            sections = raw.split("\r\n\r\n", 1)
+            header_section = sections[0] + "\r\n\r\n" if len(sections) > 0 else "\r\n\r\n"
+            body_section = sections[1] if len(sections) > 1 else ""
+
+            attributes = []
             for item in items:
                 if item in ("FLAGS",):
-                    data_parts.append(f"FLAGS {self._flags_str(meta)}")
+                    attributes.append(("FLAGS", self._flags_str(meta)))
                 elif item in ("UID",):
-                    data_parts.append(f"UID {uid}")
+                    attributes.append(("UID", str(uid)))
                 elif item in ("RFC822.SIZE", "RFC822.SIZE)"):
-                    data_parts.append(f"RFC822.SIZE {len(raw)}")
+                    attributes.append(("RFC822.SIZE", str(len(raw))))
                 elif item in ("INTERNALDATE",):
                     tm = time.gmtime(meta.received_at)
                     s = time.strftime("%d-%b-%Y %H:%M:%S +0000", tm)
-                    data_parts.append(f'INTERNALDATE "{s}"')
-                elif item in ("RFC822", "BODY[]", "BODY.PEEK[]"):
-                    data_parts.append(f"RFC822 {{{len(raw)}}}")
-                    self._send_untagged(f"{seq} FETCH (" + " ".join(data_parts) + ")")
-                    self.sock.sendall((raw + "\r\n").encode("utf-8", errors="replace"))
-                    data_parts = [")"]
-                    continue
-                elif item in ("RFC822.HEADER", "BODY[HEADER]", "BODY.PEEK[HEADER]"):
-                    hdr = raw.split("\r\n\r\n", 1)[0] + "\r\n\r\n"
-                    data_parts.append(f"RFC822.HEADER {{{len(hdr)}}}")
-                    self._send_untagged(f"{seq} FETCH (" + " ".join(data_parts) + ")")
-                    self.sock.sendall(hdr.encode("utf-8", errors="replace"))
-                    data_parts = [")"]
-                    continue
+                    attributes.append(("INTERNALDATE", f'"{s}"'))
+                elif item in ("RFC822",):
+                    attributes.append(("RFC822", raw.encode("utf-8", errors="replace")))
+                    if not any(a[0] == "FLAGS" for a in attributes):
+                        pass
+                elif item in ("RFC822.HEADER",):
+                    hdr_bytes = header_section.encode("utf-8", errors="replace")
+                    attributes.append(("RFC822.HEADER", hdr_bytes))
                 elif item in ("RFC822.TEXT",):
-                    sections = raw.split("\r\n\r\n", 1)
-                    body = sections[1] if len(sections) > 1 else ""
-                    data_parts.append(f"RFC822.TEXT {{{len(body)}}}")
-                    self._send_untagged(f"{seq} FETCH (" + " ".join(data_parts) + ")")
-                    self.sock.sendall(body.encode("utf-8", errors="replace"))
-                    data_parts = [")"]
-                    continue
+                    body_bytes = body_section.encode("utf-8", errors="replace")
+                    attributes.append(("RFC822.TEXT", body_bytes))
+                elif item in ("BODY[]", "BODY.PEEK[]"):
+                    attributes.append(("BODY[]", raw.encode("utf-8", errors="replace")))
+                elif item in ("BODY[HEADER]", "BODY.PEEK[HEADER]"):
+                    hdr_bytes = header_section.encode("utf-8", errors="replace")
+                    attributes.append(("BODY[HEADER]", hdr_bytes))
                 elif item.startswith("BODY["):
-                    data_parts.append(f"BODY[] {{{len(raw)}}}")
-                    self._send_untagged(f"{seq} FETCH (" + " ".join(data_parts) + ")")
-                    self.sock.sendall((raw + "\r\n").encode("utf-8", errors="replace"))
-                    data_parts = [")"]
-                    continue
-            if data_parts and data_parts != [")"]:
-                self._send_untagged(f"{seq} FETCH (" + " ".join(data_parts) + ")")
+                    attributes.append(("BODY[]", raw.encode("utf-8", errors="replace")))
+
+            self._send_fetch_response(seq, attributes)
         self._send(tag, "OK FETCH completed")
+
+    def _send_fetch_response(self, seq: int, attributes):
+        """
+        Send a FETCH response with proper literal handling.
+        
+        Each attribute is (name, value) where value is either:
+          - a string (normal inline value)
+          - bytes (literal value, sent as {N}\\r\\n<bytes>)
+        
+        The whole response is one line like:
+          * 3 FETCH (FLAGS (\\Seen) UID 17 RFC822 {1234}\\r\\n...data...)\r\n
+        """
+        buf = bytearray()
+        buf += f"* {seq} FETCH (".encode("utf-8")
+        first = True
+        for name, value in attributes:
+            if not first:
+                buf += b" "
+            first = False
+            if isinstance(value, bytes):
+                buf += f"{name} {{{len(value)}}}\r\n".encode("utf-8")
+                self.sock.sendall(bytes(buf))
+                buf = bytearray()
+                self.sock.sendall(value)
+            else:
+                buf += f"{name} {value}".encode("utf-8")
+        buf += b")\r\n"
+        self.sock.sendall(bytes(buf))
 
     def _cmd_store(self, tag: str, args: str):
         self._do_store(tag, args, uid_mode=False)
@@ -615,7 +646,116 @@ class IMAPSession:
         self._send(tag, "OK COPY completed")
 
     def _cmd_append(self, tag: str, args: str):
+        if self.state == "NON_AUTHENTICATED":
+            self._send(tag, "BAD APPEND requires authentication")
+            return
+
+        rest = args.strip()
+        if not rest:
+            self._send(tag, "BAD APPEND requires mailbox")
+            return
+
+        folder, rest = self._next_imap_token(rest)
+        folder = self._parse_imap_string(folder)
+        rest = rest.strip()
+
+        flag_list = []
+        date_time = None
+
+        if rest.startswith("("):
+            flags_str, rest = self._extract_parenthesized(rest)
+            flag_list = re.findall(r"\\?\w+", flags_str)
+            rest = rest.strip()
+
+        if rest.startswith('"'):
+            date_str, rest = self._next_imap_token(rest)
+            date_time = self._parse_imap_string(date_str)
+            rest = rest.strip()
+
+        m = re.match(r"\{(\d+)\}\s*$", rest)
+        if not m:
+            self._send(tag, "BAD APPEND requires message literal at end")
+            return
+        n_bytes = int(m.group(1))
+
+        self._send_continuation("Ready for literal data")
+        msg_data = self._read_literal(n_bytes)
+
+        try:
+            raw_text = msg_data.decode("utf-8", errors="replace")
+        except Exception:
+            raw_text = msg_data.decode("latin-1", errors="replace")
+
+        from .models import EmailMessage
+        msg = EmailMessage.from_raw(raw_text, sender="", recipients=[self.user])
+        msg.size = n_bytes
+
+        if flag_list:
+            flag_lower = [f.lower().lstrip("\\") for f in flag_list]
+            if "seen" in flag_lower:
+                msg.headers["X-IMAP-Flag-Seen"] = "true"
+
+        meta = self.mailbox.store_message(self.user, msg, folder)
+        if meta and "\\seen" not in [f.lower() for f in flag_list] and "seen" not in [f.lower() for f in flag_list]:
+            pass
+        else:
+            if "seen" in [f.lower().lstrip("\\") for f in flag_list]:
+                self.mailbox.update_flags(self.user, folder, meta.uid, seen=True)
+
+        self.logger.info(f"[{self.client_ip}] APPEND {folder}: {n_bytes} bytes, msg_id={msg.id}")
         self._send(tag, "OK APPEND completed")
+
+    def _next_imap_token(self, s: str) -> Tuple[str, str]:
+        s = s.strip()
+        if not s:
+            return "", ""
+        if s[0] == '"':
+            end = 1
+            escaped = False
+            while end < len(s):
+                c = s[end]
+                if escaped:
+                    escaped = False
+                elif c == "\\":
+                    escaped = True
+                elif c == '"':
+                    end += 1
+                    break
+                end += 1
+            return s[:end], s[end:]
+        if s[0] == "(":
+            depth = 1
+            i = 1
+            while i < len(s) and depth > 0:
+                if s[i] == "(":
+                    depth += 1
+                elif s[i] == ")":
+                    depth -= 1
+                i += 1
+            return s[:i], s[i:]
+        if s[0] == "{":
+            end = s.find("}")
+            if end == -1:
+                return s, ""
+            return s[:end + 1], s[end + 1:]
+        parts = s.split(None, 1)
+        if len(parts) == 1:
+            return parts[0], ""
+        return parts[0], parts[1]
+
+    def _extract_parenthesized(self, s: str) -> Tuple[str, str]:
+        s = s.strip()
+        if not s.startswith("("):
+            return "", s
+        depth = 1
+        i = 1
+        while i < len(s) and depth > 0:
+            if s[i] == "(":
+                depth += 1
+            elif s[i] == ")":
+                depth -= 1
+            i += 1
+        return s[1:i - 1], s[i:]
 
     def _cmd_uid(self, tag: str, args: str):
         parts = args.split(None, 1)

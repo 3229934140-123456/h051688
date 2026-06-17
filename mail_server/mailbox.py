@@ -84,6 +84,52 @@ class MailboxStore:
                 folders.append(name)
         return folders or self.DEFAULT_FOLDERS
 
+    def create_folder(self, email: str, folder: str) -> bool:
+        """
+        Create a new folder (mailbox). Returns True if created, False if already exists.
+        """
+        if not self.user_exists(email):
+            return False
+        with self.lock:
+            self._ensure_user(email)
+            folder_dir = self._folder_dir(email, folder)
+            if os.path.isdir(folder_dir):
+                return False
+            os.makedirs(folder_dir, exist_ok=True)
+            meta_path = self._meta_path(email, folder)
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump({"next_uid": 1, "messages": []}, f, indent=2)
+            self.logger.info(f"Created folder {folder} for {email}")
+            return True
+
+    def delete_folder(self, email: str, folder: str) -> bool:
+        if not self.user_exists(email):
+            return False
+        if folder.upper() == "INBOX":
+            return False
+        with self.lock:
+            folder_dir = self._folder_dir(email, folder)
+            if not os.path.isdir(folder_dir):
+                return False
+            import shutil
+            shutil.rmtree(folder_dir)
+            self.logger.info(f"Deleted folder {folder} for {email}")
+            return True
+
+    def rename_folder(self, email: str, old_name: str, new_name: str) -> bool:
+        if not self.user_exists(email):
+            return False
+        if old_name.upper() == "INBOX":
+            return False
+        with self.lock:
+            old_dir = self._folder_dir(email, old_name)
+            new_dir = self._folder_dir(email, new_name)
+            if not os.path.isdir(old_dir) or os.path.exists(new_dir):
+                return False
+            os.rename(old_dir, new_dir)
+            self.logger.info(f"Renamed folder {old_name} -> {new_name} for {email}")
+            return True
+
     def _load_meta(self, email: str, folder: str) -> Dict:
         meta_path = self._meta_path(email, folder)
         self._ensure_user(email)
@@ -111,8 +157,8 @@ class MailboxStore:
             meta_data["next_uid"] = uid + 1
 
             msg_path = self._message_path(email, folder, uid)
-            with open(msg_path, "w", encoding="utf-8") as f:
-                f.write(message.raw_data)
+            with open(msg_path, "wb") as f:
+                f.write(message.raw_data.encode("utf-8", errors="replace"))
 
             mmeta = MailboxMeta(
                 message_id=message.id,
@@ -138,11 +184,9 @@ class MailboxStore:
             return messages
 
     def get_message(self, email: str, folder: str, uid: int) -> Optional[EmailMessage]:
-        msg_path = self._message_path(email, folder, uid)
-        if not os.path.exists(msg_path):
+        raw = self.get_message_raw(email, folder, uid)
+        if raw is None:
             return None
-        with open(msg_path, "r", encoding="utf-8") as f:
-            raw = f.read()
         meta_list = self.list_messages(email, folder, include_deleted=True)
         meta = next((m for m in meta_list if m.uid == uid), None)
         msg = EmailMessage()
@@ -166,8 +210,9 @@ class MailboxStore:
         msg_path = self._message_path(email, folder, uid)
         if not os.path.exists(msg_path):
             return None
-        with open(msg_path, "r", encoding="utf-8") as f:
-            return f.read()
+        with open(msg_path, "rb") as f:
+            data = f.read()
+        return data.decode("utf-8", errors="replace")
 
     def update_flags(self, email: str, folder: str, uid: int, **flags) -> bool:
         with self.lock:
