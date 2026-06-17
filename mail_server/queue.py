@@ -26,11 +26,20 @@ class RemoteDeliveryError(Exception):
 def dot_stuff_message(raw: str) -> str:
     """
     Apply SMTP dot-stuffing per RFC 5321 §4.5.2.
+    - Ensure exactly one trailing CRLF (normalize if missing)
+    - Split into lines and drop only the single trailing empty string
+      produced by split() on a CRLF-terminated string (not real empty lines)
     - Lines starting with '.' get an extra '.' prepended
-    - The message is normalized to end with \r\n
-    - A terminating '.\r\n' is appended
+    - Append terminating '.\r\n'
+    This is fully reversible: a compliant receiver doing dot-unstuffing
+    and line reassembly will recover the original message byte-for-byte
+    (after normalization to exactly one trailing CRLF).
     """
+    if not raw.endswith("\r\n"):
+        raw = raw + "\r\n"
     lines = raw.split("\r\n")
+    if lines and lines[-1] == "":
+        lines = lines[:-1]
     stuffed = []
     for line in lines:
         if line.startswith("."):
@@ -299,16 +308,29 @@ class DeliveryQueue:
     # ---------- delivery processing ----------
     def _process_single(self, item: QueueItem):
         try:
+            if item.status == "cancelled":
+                self.logger.info(f"Item {item.id} cancelled, skipping")
+                return
             self._attempt_delivery(item)
         except Exception as e:
             self.logger.exception(f"Error processing queue item {item.id}: {e}")
             item.last_error = str(e)
+            item.status = "pending"
             self._schedule_retry(item)
 
     def _attempt_delivery(self, item: QueueItem):
         if not item.pending_recipients:
             self._finalize_item(item)
             return
+
+        # Figure out which domain we're currently working on
+        pending_domains = set()
+        for r in item.pending_recipients:
+            _, dom = split_email(r)
+            pending_domains.add(dom)
+        item.current_domain = ",".join(sorted(pending_domains))
+        item.status = "delivering"
+        self._save_item(item)
 
         self.logger.info(
             f"Attempting delivery of {item.id} (retry {item.retries}) to {item.pending_recipients}"
@@ -333,11 +355,18 @@ class DeliveryQueue:
                 self.logger.warning(
                     f"Item {item.id} exhausted retries ({Config.MAX_QUEUE_RETRIES}), bouncing"
                 )
+                item.status = "failed"
+                item.failed_at = time.time()
+                self._save_item(item)
                 self._bounce_failed(item)
                 self._delete_item(item)
             else:
+                item.status = "pending"
                 self._schedule_retry(item)
         else:
+            item.status = "completed"
+            item.completed_at = time.time()
+            self._save_item(item)
             self.logger.info(f"Item {item.id} fully delivered")
             self._finalize_item(item)
 
@@ -431,6 +460,81 @@ class DeliveryQueue:
         with self.lock:
             items = self._load_all_items()
         total = len(items)
-        pending = sum(1 for i in items if i.pending_recipients)
+        pending = sum(1 for i in items if i.status == "pending")
         retrying = sum(1 for i in items if i.retries > 0)
-        return {"total": total, "pending": pending, "retrying": retrying, "items": [i.id for i in items]}
+        delivering = sum(1 for i in items if i.status == "delivering")
+        failed = sum(1 for i in items if i.status == "failed")
+        cancelled = sum(1 for i in items if i.status == "cancelled")
+        return {
+            "total": total,
+            "pending": pending,
+            "delivering": delivering,
+            "failed": failed,
+            "cancelled": cancelled,
+            "retrying": retrying,
+            "items": [i.id for i in items],
+        }
+
+    def list_queue_items(self) -> List[Dict]:
+        """Return detailed info for every queue item (for admin)."""
+        with self.lock:
+            items = self._load_all_items()
+        result = []
+        for it in items:
+            result.append({
+                "id": it.id,
+                "status": it.status,
+                "current_domain": it.current_domain,
+                "pending_recipients": list(it.pending_recipients),
+                "delivered_recipients": list(it.delivered_recipients),
+                "failed_recipients": dict(it.failed_recipients),
+                "retries": it.retries,
+                "next_retry_at": it.next_attempt,
+                "last_error": it.last_error,
+                "created_at": it.created_at,
+                "subject": it.message.headers.get("Subject", ""),
+                "sender": it.message.sender,
+            })
+        return result
+
+    def manual_retry(self, item_id_prefix: str) -> Tuple[bool, str]:
+        """Force a pending/failed item to be retried immediately."""
+        with self.lock:
+            items = self._load_all_items()
+            target = None
+            for it in items:
+                if it.id == item_id_prefix or it.id.startswith(item_id_prefix):
+                    target = it
+                    break
+            if target is None:
+                return False, f"no queue item matching '{item_id_prefix}'"
+            if target.status == "cancelled":
+                return False, f"item {target.id} is cancelled"
+            target.status = "pending"
+            target.next_attempt = time.time()
+            target.retries = max(0, target.retries - 1)
+            target.last_error = ""
+            self._save_item(target)
+            self.logger.info(f"Manual retry scheduled for {target.id}")
+            threading.Thread(target=self._process_single, args=(target,), daemon=True).start()
+            return True, f"scheduled retry for {target.id} (domain={target.current_domain})"
+
+    def cancel_item(self, item_id_prefix: str) -> Tuple[bool, str]:
+        """Cancel a queued item; delivery is abandoned and no bounce is sent."""
+        with self.lock:
+            items = self._load_all_items()
+            target = None
+            for it in items:
+                if it.id == item_id_prefix or it.id.startswith(item_id_prefix):
+                    target = it
+                    break
+            if target is None:
+                return False, f"no queue item matching '{item_id_prefix}'"
+            if target.status == "completed":
+                return False, f"item {target.id} already completed"
+            target.status = "cancelled"
+            target.cancelled_at = time.time()
+            target.pending_recipients = []
+            self._save_item(target)
+            self.logger.info(f"Cancelled queue item {target.id}")
+            return True, f"cancelled {target.id}"

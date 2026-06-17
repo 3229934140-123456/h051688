@@ -24,6 +24,7 @@ import time
 
 from mail_server.config import Config
 from mail_server.mailbox import MailboxStore
+from mail_server.accounts import AccountManager
 from mail_server.router import AddressRouter
 from mail_server.queue import DeliveryQueue
 from mail_server.smtpd import SMTPServer
@@ -48,6 +49,8 @@ def main():
     logger.info("=" * 60)
 
     mailbox = MailboxStore()
+    accounts = AccountManager(mailbox=mailbox)
+    mailbox.account_manager = accounts
     router = AddressRouter(mailbox)
     queue = DeliveryQueue(mailbox, router)
     queue.start()

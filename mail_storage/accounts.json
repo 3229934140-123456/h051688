@@ -1,0 +1,23 @@
+{
+  "alice@example.com": {
+    "email": "alice@example.com",
+    "password": "password123",
+    "active": true,
+    "created_at": 1781670537.6702538,
+    "disabled_at": null
+  },
+  "bob@example.com": {
+    "email": "bob@example.com",
+    "password": "password123",
+    "active": true,
+    "created_at": 1781670537.6702611,
+    "disabled_at": null
+  },
+  "admin@example.com": {
+    "email": "admin@example.com",
+    "password": "admin123",
+    "active": true,
+    "created_at": 1781670537.6702645,
+    "disabled_at": null
+  }
+}

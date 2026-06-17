@@ -32,11 +32,12 @@ class MailboxStore:
 
     DEFAULT_FOLDERS = ["INBOX", "Sent", "Spam", "Trash"]
 
-    def __init__(self):
+    def __init__(self, account_manager=None):
         Config.ensure_dirs()
         self.base_dir = Config.MAIL_STORAGE_DIR
         self.lock = threading.RLock()
         self.logger = setup_logger("mailbox", os.path.join(Config.LOG_DIR, "mailbox.log"))
+        self.account_manager = account_manager  # optional AccountManager for dynamic auth
 
     def _user_dir(self, email: str) -> str:
         local, domain = split_email(email)
@@ -63,9 +64,13 @@ class MailboxStore:
                         json.dump({"next_uid": 1, "messages": []}, f, indent=2)
 
     def user_exists(self, email: str) -> bool:
+        if self.account_manager is not None:
+            return self.account_manager.user_exists(email)
         return email.lower() in Config.USERS
 
     def authenticate(self, email: str, password: str) -> bool:
+        if self.account_manager is not None:
+            return self.account_manager.authenticate(email, password)
         email_l = email.lower()
         if email_l in Config.USERS:
             if Config.USERS[email_l] == password:

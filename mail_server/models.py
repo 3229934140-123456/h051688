@@ -57,6 +57,11 @@ class QueueItem:
     next_attempt: float = field(default_factory=time.time)
     created_at: float = field(default_factory=time.time)
     last_error: str = ""
+    status: str = "pending"
+    current_domain: str = ""
+    cancelled_at: Optional[float] = None
+    failed_at: Optional[float] = None
+    completed_at: Optional[float] = None
 
     def get_queue_path(self, queue_dir: str) -> str:
         return os.path.join(queue_dir, f"{self.id}.json")
@@ -73,6 +78,12 @@ class QueueItem:
     def from_json(cls, data: str) -> "QueueItem":
         d = json.loads(data)
         d["message"] = EmailMessage(**d["message"])
+        # Backward compat for fields added later
+        for fld in ("status", "current_domain"):
+            d.setdefault(fld, "")
+        d.setdefault("status", "pending")
+        for fld in ("cancelled_at", "failed_at", "completed_at"):
+            d.setdefault(fld, None)
         return cls(**d)
 
 

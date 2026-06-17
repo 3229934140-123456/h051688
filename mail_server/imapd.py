@@ -180,7 +180,11 @@ class IMAPSession:
         }.get(verb)
 
         if handler:
-            handler(tag, args)
+            try:
+                handler(tag, args)
+            except Exception as e:
+                self.logger.exception(f"[{self.client_ip}] IMAP handler error for {verb}: {e}")
+                self._send(tag, f"BAD internal error: {e}")
         else:
             self._send(tag, "BAD unknown command")
 
@@ -396,26 +400,35 @@ class IMAPSession:
         self._send(tag, "OK LIST completed")
 
     def _cmd_status(self, tag: str, args: str):
-        parts = self._split_args(args)
-        if len(parts) < 2:
+        rest = args.strip()
+        if not rest:
             self._send(tag, "BAD STATUS requires mailbox and items")
             return
-        folder = self._parse_imap_string(parts[0])
-        items = parts[1].strip("()").upper() if len(parts) > 1 else ""
-        count, total, unseen = self.mailbox.folder_stats(self.user, folder)
+        folder, rest = self._next_imap_token(rest)
+        folder = self._parse_imap_string(folder)
+        rest = rest.strip()
+        items_str, _ = self._extract_parenthesized(rest)
+        if not items_str:
+            items_upper = rest.upper()
+        else:
+            items_upper = items_str.upper()
+        try:
+            count, total, unseen = self.mailbox.folder_stats(self.user, folder)
+        except Exception:
+            count, total, unseen = 0, 0, 0
         messages = self.mailbox.list_messages(self.user, folder, include_deleted=False)
         next_uid = (max(m.uid for m in messages) + 1) if messages else 1
         recent = sum(1 for m in messages)
         info_parts = []
-        if "MESSAGES" in items:
+        if "MESSAGES" in items_upper:
             info_parts.append(f"MESSAGES {count}")
-        if "RECENT" in items:
+        if "RECENT" in items_upper:
             info_parts.append(f"RECENT {recent}")
-        if "UIDNEXT" in items:
+        if "UIDNEXT" in items_upper:
             info_parts.append(f"UIDNEXT {next_uid}")
-        if "UIDVALIDITY" in items:
+        if "UIDVALIDITY" in items_upper:
             info_parts.append(f"UIDVALIDITY 1")
-        if "UNSEEN" in items:
+        if "UNSEEN" in items_upper:
             info_parts.append(f"UNSEEN {unseen}")
         self._send_untagged(f'STATUS "{folder}" (' + " ".join(info_parts) + ")")
         self._send(tag, "OK STATUS completed")
@@ -486,13 +499,19 @@ class IMAPSession:
         if self.state != "SELECTED":
             self._send(tag, "BAD FETCH only valid in SELECTED state")
             return
-        parts = self._split_args(args)
-        if len(parts) < 2:
+        rest = args.strip()
+        if not rest:
             self._send(tag, "BAD FETCH requires set and items")
             return
-        ids = self._parse_set(parts[0], uid_mode=uid_mode)
-        items_raw = parts[1].strip().strip("()").upper()
-        items = re.split(r"\s+", items_raw)
+        set_str, rest = self._next_imap_token(rest)
+        ids = self._parse_set(set_str, uid_mode=uid_mode)
+        rest = rest.strip()
+        # Parse item list, which may be a parenthesized list or a single item
+        if rest.startswith("("):
+            items_str, _ = self._extract_parenthesized(rest)
+        else:
+            items_str = rest
+        items = self._parse_fetch_items(items_str)
 
         for target in ids:
             if uid_mode:
@@ -513,37 +532,129 @@ class IMAPSession:
             body_section = sections[1] if len(sections) > 1 else ""
 
             attributes = []
-            for item in items:
-                if item in ("FLAGS",):
+            for item, item_upper, raw_item in items:
+                if item_upper == "FLAGS":
                     attributes.append(("FLAGS", self._flags_str(meta)))
-                elif item in ("UID",):
+                elif item_upper == "UID":
                     attributes.append(("UID", str(uid)))
-                elif item in ("RFC822.SIZE", "RFC822.SIZE)"):
+                elif item_upper in ("RFC822.SIZE",):
                     attributes.append(("RFC822.SIZE", str(len(raw))))
-                elif item in ("INTERNALDATE",):
+                elif item_upper == "INTERNALDATE":
                     tm = time.gmtime(meta.received_at)
                     s = time.strftime("%d-%b-%Y %H:%M:%S +0000", tm)
                     attributes.append(("INTERNALDATE", f'"{s}"'))
-                elif item in ("RFC822",):
+                elif item_upper == "RFC822":
                     attributes.append(("RFC822", raw.encode("utf-8", errors="replace")))
-                    if not any(a[0] == "FLAGS" for a in attributes):
-                        pass
-                elif item in ("RFC822.HEADER",):
+                elif item_upper == "RFC822.HEADER":
                     hdr_bytes = header_section.encode("utf-8", errors="replace")
                     attributes.append(("RFC822.HEADER", hdr_bytes))
-                elif item in ("RFC822.TEXT",):
+                elif item_upper == "RFC822.TEXT":
                     body_bytes = body_section.encode("utf-8", errors="replace")
                     attributes.append(("RFC822.TEXT", body_bytes))
-                elif item in ("BODY[]", "BODY.PEEK[]"):
-                    attributes.append(("BODY[]", raw.encode("utf-8", errors="replace")))
-                elif item in ("BODY[HEADER]", "BODY.PEEK[HEADER]"):
+                elif item_upper in ("BODY[]", "BODY.PEEK[]"):
+                    attributes.append((raw_item.rstrip("]") + "]", raw.encode("utf-8", errors="replace")))
+                elif item_upper in ("BODY[HEADER]", "BODY.PEEK[HEADER]"):
                     hdr_bytes = header_section.encode("utf-8", errors="replace")
-                    attributes.append(("BODY[HEADER]", hdr_bytes))
-                elif item.startswith("BODY["):
+                    out_name = "BODY[HEADER]" if item_upper.startswith("BODY[") else "BODY.PEEK[HEADER]"
+                    attributes.append((out_name, hdr_bytes))
+                elif item_upper.startswith("BODY[HEADER.FIELDS") or item_upper.startswith("BODY.PEEK[HEADER.FIELDS"):
+                    # Parse out the list of field names inside the parentheses
+                    fields = self._extract_header_fields(raw_item)
+                    filtered = self._filter_headers(header_section, fields)
+                    out_name = "BODY[HEADER.FIELDS (" + " ".join(fields) + ")]" if item_upper.startswith("BODY[") else "BODY.PEEK[HEADER.FIELDS (" + " ".join(fields) + ")]"
+                    attributes.append((out_name, filtered.encode("utf-8", errors="replace")))
+                elif item_upper.startswith("BODY[TEXT]") or item_upper.startswith("BODY.PEEK[TEXT]"):
+                    body_bytes = body_section.encode("utf-8", errors="replace")
+                    out_name = "BODY[TEXT]" if item_upper.startswith("BODY[") else "BODY.PEEK[TEXT]"
+                    attributes.append((out_name, body_bytes))
+                elif item_upper.startswith("BODY[") or item_upper.startswith("BODY.PEEK["):
+                    # Fallback: return full body for any other BODY[...] request
                     attributes.append(("BODY[]", raw.encode("utf-8", errors="replace")))
 
             self._send_fetch_response(seq, attributes)
         self._send(tag, "OK FETCH completed")
+
+    def _parse_fetch_items(self, items_str: str) -> List[Tuple[str, str, str]]:
+        """
+        Parse a FETCH attribute list into individual tokens, preserving
+        case and parenthesized sub-lists inside BODY[HEADER.FIELDS (...)].
+        Returns list of (item, item_upper, raw_item).
+        """
+        items = []
+        s = items_str.strip()
+        i = 0
+        n = len(s)
+        while i < n:
+            while i < n and s[i] in (" ", "\t"):
+                i += 1
+            if i >= n:
+                break
+            if s[i] == "(":
+                depth = 1
+                j = i + 1
+                while j < n and depth > 0:
+                    if s[j] == "(":
+                        depth += 1
+                    elif s[j] == ")":
+                        depth -= 1
+                    j += 1
+                raw = s[i + 1:j - 1]
+                sub_items = self._parse_fetch_items(raw)
+                items.extend(sub_items)
+                i = j
+                continue
+            # Otherwise, read until space, but if we hit '[' keep going until matching ']'
+            start = i
+            bracket_depth = 0
+            while i < n:
+                c = s[i]
+                if c == "[":
+                    bracket_depth += 1
+                elif c == "]":
+                    bracket_depth -= 1
+                elif c in (" ", "\t") and bracket_depth == 0:
+                    break
+                i += 1
+            tok = s[start:i]
+            if tok:
+                items.append((tok, tok.upper(), tok))
+        return items
+
+    def _extract_header_fields(self, raw_item: str) -> List[str]:
+        """Extract field names from BODY[HEADER.FIELDS (From To Subject)]."""
+        start = raw_item.find("(")
+        end = raw_item.rfind(")")
+        if start < 0 or end < 0 or end <= start:
+            return []
+        inner = raw_item[start + 1:end]
+        return [f.strip() for f in inner.split() if f.strip()]
+
+    def _filter_headers(self, header_section: str, field_names: List[str]) -> str:
+        """
+        Filter the provided header section (with trailing \\r\\n\\r\\n) and
+        keep only the requested header fields (case-insensitive match).
+        """
+        if not field_names:
+            return header_section
+        wanted = {f.lower() for f in field_names}
+        result_lines = []
+        current_key = None
+        for line in header_section.split("\r\n"):
+            if not line:
+                break
+            if line.startswith((" ", "\t")) and current_key is not None:
+                # Continuation of previous header
+                if current_key in wanted:
+                    result_lines.append(line)
+            else:
+                if ":" in line:
+                    key, _ = line.split(":", 1)
+                    current_key = key.strip().lower()
+                    if current_key in wanted:
+                        result_lines.append(line)
+                else:
+                    current_key = None
+        return "\r\n".join(result_lines) + "\r\n\r\n"
 
     def _send_fetch_response(self, seq: int, attributes):
         """
@@ -624,6 +735,9 @@ class IMAPSession:
         self._send(tag, "OK STORE completed")
 
     def _cmd_copy(self, tag: str, args: str):
+        self._do_copy(tag, args, uid_mode=False)
+
+    def _do_copy(self, tag: str, args: str, uid_mode: bool):
         if self.state != "SELECTED":
             self._send(tag, "BAD COPY only valid in SELECTED state")
             return
@@ -631,10 +745,14 @@ class IMAPSession:
         if len(parts) < 2:
             self._send(tag, "BAD COPY requires set and mailbox")
             return
-        ids = self._parse_set(parts[0], uid_mode=False)
+        ids = self._parse_set(parts[0], uid_mode=uid_mode)
         dest_folder = self._parse_imap_string(parts[1])
-        for seq in ids:
-            uid = self._sequence_to_uid(seq)
+        copied_uids = []
+        for target in ids:
+            if uid_mode:
+                uid = target
+            else:
+                uid = self._sequence_to_uid(target)
             if uid is None:
                 continue
             raw = self.mailbox.get_message_raw(self.user, self.current_folder, uid)
@@ -642,7 +760,12 @@ class IMAPSession:
                 continue
             from .models import EmailMessage
             msg = EmailMessage.from_raw(raw, sender="", recipients=[self.user])
-            self.mailbox.store_message(self.user, msg, dest_folder)
+            stored = self.mailbox.store_message(self.user, msg, dest_folder)
+            if stored:
+                copied_uids.append(stored.uid)
+        if uid_mode and copied_uids:
+            copyuid = ",".join(str(u) for u in copied_uids)
+            self._send_untagged(f'OK [COPYUID {1} {",".join(str(i) for i in ids)} {copyuid}]')
         self._send(tag, "OK COPY completed")
 
     def _cmd_append(self, tag: str, args: str):
@@ -775,7 +898,7 @@ class IMAPSession:
             self._send_untagged("SEARCH " + " ".join(result))
             self._send(tag, "OK UID SEARCH completed")
         elif sub == "COPY":
-            self._send(tag, "OK UID COPY completed")
+            self._do_copy(tag, sub_args, uid_mode=True)
         elif sub == "EXPUNGE":
             self._cmd_expunge(tag, sub_args)
         else:
