@@ -1,0 +1,60 @@
+{
+  "next_uid": 8,
+  "messages": [
+    {
+      "message_id": "adf49b8ca55d46e4bad0d70ad1bb3983",
+      "uid": 2,
+      "folder": "INBOX",
+      "seen": true,
+      "answered": false,
+      "flagged": false,
+      "deleted": false,
+      "received_at": 1781663431.335019,
+      "size": 29
+    },
+    {
+      "message_id": "4a22eca07e8c4d1aa4223495d1f1e195",
+      "uid": 3,
+      "folder": "INBOX",
+      "seen": false,
+      "answered": false,
+      "flagged": false,
+      "deleted": false,
+      "received_at": 1781663432.3498363,
+      "size": 252
+    },
+    {
+      "message_id": "916e799d5a374d6cb652a1bfc1d271cc",
+      "uid": 5,
+      "folder": "INBOX",
+      "seen": false,
+      "answered": false,
+      "flagged": false,
+      "deleted": false,
+      "received_at": 1781663545.8902922,
+      "size": 29
+    },
+    {
+      "message_id": "3a4b873ab3d648fdbd2d2a3c03626bd9",
+      "uid": 6,
+      "folder": "INBOX",
+      "seen": true,
+      "answered": false,
+      "flagged": false,
+      "deleted": false,
+      "received_at": 1781663546.9037156,
+      "size": 252
+    },
+    {
+      "message_id": "fe29a86a3ebb4b09bd9c6bc6a362619a",
+      "uid": 7,
+      "folder": "INBOX",
+      "seen": false,
+      "answered": false,
+      "flagged": false,
+      "deleted": false,
+      "received_at": 1781663547.4217572,
+      "size": 33
+    }
+  ]
+}
